@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CRT Short Scanner</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;padding:12px}
+h1{font-size:18px;margin:0 0 10px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:10px;margin-bottom:10px}
+label{font-size:12px;color:#8b949e;display:block;margin:6px 0 2px}
+input,select,textarea{width:100%;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:8px;font-size:14px}
+textarea{height:64px}
+.row{display:flex;gap:8px}.row>div{flex:1}
+button{width:100%;margin-top:10px;padding:12px;border:0;border-radius:8px;background:#238636;color:#fff;font-size:15px;font-weight:600}
+button:disabled{opacity:.5}
+.chk{display:flex;align-items:center;gap:8px;margin-top:8px;font-size:13px;color:#8b949e}
+.chk input{width:auto}
+#status{font-size:12px;color:#8b949e;margin:6px 0}
+.bias{font-size:13px;line-height:1.6}
+.bias.ok{border-color:#f85149;background:#2a1517}
+.bias.no{border-color:#d29922;background:#2a2210}
+.res{border-left:4px solid #8b949e}
+.res.s2{border-left-color:#d29922}.res.s3{border-left-color:#db6d28}
+.res.s4{border-left-color:#f85149}.res.s5{border-left-color:#f85149;background:#2a1517}
+.top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.sym{font-weight:700;font-size:16px}
+.tag{font-size:11px;padding:2px 8px;border-radius:10px;font-weight:700;background:#30363d;color:#c9d1d9;text-align:right}
+.s2 .tag{background:#d2992233;color:#d29922}.s3 .tag{background:#db6d2833;color:#db6d28}
+.s4 .tag,.s5 .tag{background:#f8514933;color:#f85149}
+.steps{display:flex;gap:4px;margin:8px 0}
+.step{flex:1;font-size:10px;text-align:center;padding:4px 2px;border-radius:6px;background:#0d1117;border:1px solid #30363d;color:#6e7681}
+.step.on{background:#23863633;border-color:#238636;color:#3fb950}
+.step.now{background:#d2992233;border-color:#d29922;color:#d29922}
+.meta{font-size:12px;color:#8b949e;line-height:1.7}
+.meta b{color:#e6edf3}
+a{color:#58a6ff;text-decoration:none;font-size:12px}
+</style>
+</head>
+<body>
+<h1>CRT Short Scanner</h1>
+
+<div class="card">
+  <label>Coins (comma separated)</label>
+  <textarea id="coins">BTC,ETH,SOL,XRP,BNB,DOGE,ADA,AVAX,LINK,DOT,TRX,LTC,BCH,NEAR,UNI,APT,ARB,OP,SUI,INJ,ATOM,FIL,ETC,AAVE,TON,WIF,FET,HBAR,ICP,RUNE</textarea>
+  <div class="row">
+    <div><label>BTC Daily bias filter</label>
+      <select id="bias">
+        <option value="strict" selected>Bearish: Daily closes below prev low</option>
+        <option value="loose">Bearish: Daily closes below prev close</option>
+        <option value="off">Ignore bias</option>
+      </select>
+    </div>
+    <div><label>C1 (previous 4H) color</label>
+      <select id="c1color"><option value="any" selected>Any color</option><option value="green">Green only</option></select>
+    </div>
+  </div>
+  <div class="row">
+    <div><label>Candle % measure</label>
+      <select id="measure"><option value="range">Full range (high-low)</option><option value="body">Body (open-close)</option></select>
+    </div>
+    <div><label>Show stage</label>
+      <select id="minStage">
+        <option value="1">All (incl. waiting sweep)</option>
+        <option value="2" selected>Swept and up</option>
+        <option value="3">Divergence and up</option>
+        <option value="4">iFVG forming / confirmed</option>
+        <option value="5">iFVG confirmed only</option>
+      </select>
+    </div>
+  </div>
+  <div class="row">
+    <div><label>RSI period</label><input id="rsiN" type="number" value="14"></div>
+    <div></div>
+  </div>
+  <div class="chk"><input type="checkbox" id="auto"><span>Auto-scan every 5 min</span></div>
+  <button id="go">Scan</button>
+</div>
+
+<div id="biasBox"></div>
+<div id="status"></div>
+<div id="out"></div>
+
+<script>
+const H4 = 14400, M5 = 300, D1 = 86400;
+
+const BASES = ['https://fapi.binance.com/fapi/v1/klines', 'https://data-api.binance.vision/api/v3/klines'];
+async function klines(sym, interval, limit){
+  let lastErr;
+  for(const base of BASES){
+    try{
+      const r = await fetch(`${base}?symbol=${sym}USDT&interval=${interval}&limit=${limit}`);
+      if(!r.ok) throw new Error('HTTP ' + r.status);
+      const j = await r.json();
+      return j.map(k => ({time:Math.floor(k[0]/1000), open:+k[1], high:+k[2], low:+k[3], close:+k[4]}));
+    }catch(e){ lastErr = e; }
+  }
+  throw lastErr;
+}
+const getH4 = s => klines(s, '4h', 30);
+const getM5 = s => klines(s, '5m', 1500);
+const closedOnly = (arr, step) => { const now = Date.now()/1000; return arr.filter(x => x.time + step <= now); };
+
+function rsi(c, n){
+  const r = new Array(c.length).fill(null);
+  if(c.length <= n) return r;
+  let g=0, l=0;
+  for(let i=1;i<=n;i++){ const d=c[i]-c[i-1]; d>=0 ? g+=d : l-=d; }
+  g/=n; l/=n;
+  r[n] = l===0 ? 100 : 100-100/(1+g/l);
+  for(let i=n+1;i<c.length;i++){
+    const d=c[i]-c[i-1];
+    g=(g*(n-1)+(d>0?d:0))/n; l=(l*(n-1)+(d<0?-d:0))/n;
+    r[i] = l===0 ? 100 : 100-100/(1+g/l);
+  }
+  return r;
+}
+
+async function btcBias(mode){
+  const d = closedOnly(await klines('BTC', '1d', 6), D1);
+  const l = d[d.length-1], p = d[d.length-2];
+  const bear = mode === 'strict' ? l.close < p.low : l.close < p.close;
+  return {bear, l, p};
+}
+
+function analyze(sym, k4, m5raw, cfg){
+  const c4 = closedOnly(k4, H4);
+  if(c4.length < 2) return null;
+  const c1 = c4[c4.length-1];                       // previous (last closed) 4H candle
+  if(cfg.c1color === 'green' && c1.close <= c1.open) return null;
+  const rangePct = (c1.high-c1.low)/c1.low*100;
+  const bodyPct  = Math.abs(c1.close-c1.open)/c1.open*100;
+  const res = {sym, stage:1, c1, rangePct, bodyPct, green:c1.close>c1.open, price:k4[k4.length-1].close};
+  const c1end = c1.time + H4;                       // current 4H candle (C2) starts here
+
+  // quick pre-check so 5m is only pulled when price already broke C1 high
+  if(!k4.some(x => x.time >= c1end && x.high > c1.high)) return res;
+
+  const now = Date.now()/1000;
+  const m = m5raw.filter(x => x.time + M5 <= now);  // closed 5m candles only
+  if(!m.length) return res;
+  res.price = m[m.length-1].close;
+
+  const si = m.findIndex(x => x.time >= c1end && x.high > c1.high);
+  if(si < 0) return res;
+  res.stage = 2;
+  res.sweepTime = m[si].time;
+  res.sweepHigh = Math.max(...m.slice(si).map(x => x.high));
+
+  // pivot highs (3 left / 3 right)
+  const rs = rsi(m.map(x => x.close), cfg.rsiN);
+  const piv = [];
+  for(let i=Math.max(3, si-60); i<=m.length-4; i++){
+    let ok = true;
+    for(let k=1;k<=3;k++){ if(m[i].high <= m[i-k].high || m[i].high <= m[i+k].high){ ok=false; break; } }
+    if(ok) piv.push(i);
+  }
+
+  // bearish divergence: pivot at/after sweep, higher price high, lower RSI
+  let div = null;
+  for(let a=0; a<piv.length; a++){
+    const i2 = piv[a];
+    if(i2 < si) continue;
+    for(let b=Math.max(0,a-2); b<a; b++){
+      const i1 = piv[b];
+      if(rs[i1]==null || rs[i2]==null) continue;
+      if(m[i2].high > m[i1].high && rs[i2] < rs[i1]-1){
+        div = {i1, i2, rsi1:rs[i1], rsi2:rs[i2], time:m[i2].time};
+      }
+    }
+  }
+  if(!div) return res;
+  res.stage = 3;
+  res.div = div;
+
+  // iFVG: bullish FVG (gap between high[j-2] and low[j]) later closed through below its bottom
+  let confirmed = null, forming = null;
+  for(let j=Math.max(2, si-12); j<m.length; j++){
+    if(!(m[j].low > m[j-2].high)) continue;
+    const top = m[j].low, bottom = m[j-2].high;
+    let inv = -1;
+    for(let k=j+1;k<m.length;k++){ if(m[k].close < bottom){ inv = k; break; } }
+    if(inv === -1){
+      forming = {top, bottom, time:m[j].time};
+    } else if(inv > div.i2){
+      if(!confirmed || inv > confirmed.k) confirmed = {top, bottom, fvgTime:m[j].time, k:inv, time:m[inv].time + M5};
+    }
+  }
+  if(confirmed){ res.stage = 5; res.ifvg = confirmed; }
+  else if(forming){ res.stage = 4; res.ifvg = forming; }
+  return res;
+}
+
+const fmtT = t => new Date(t*1000).toLocaleString('en-PH',{timeZone:'Asia/Manila',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit',hour12:false}) + ' PH';
+const fmtP = p => p>=1 ? p.toFixed(p>=100?2:4) : p.toPrecision(4);
+const LABEL = {1:'Waiting for sweep',2:'Swept - watching 5m divergence',3:'Divergence - waiting iFVG',4:'iFVG forming',5:'iFVG CONFIRMED - SHORT'};
+
+function card(r){
+  const s = r.stage;
+  const chip = (txt, on, now) => `<div class="step ${on?'on':''} ${now?'now':''}">${txt}</div>`;
+  const steps =
+    chip('1 C1', s>=1, s===1) + chip('2 Sweep', s>=2, s===2) +
+    chip('3 Div', s>=3, s===3) + chip('4 iFVG', s>=4, s===4) + chip('5 Entry', s>=5, false);
+  let lines = `C1 (${r.green?'green':'red'}, prev 4H): ${fmtT(r.c1.time)} · range <b>${r.rangePct.toFixed(2)}%</b> · body <b>${r.bodyPct.toFixed(2)}%</b><br>
+    C1 high: <b>${fmtP(r.c1.high)}</b> · price now: ${fmtP(r.price)}`;
+  if(s>=2) lines += `<br>Sweep: ${fmtT(r.sweepTime)} · sweep high: <b>${fmtP(r.sweepHigh)}</b>`;
+  if(s>=3) lines += `<br>5m divergence: high @ ${fmtT(r.div.time)} · RSI ${r.div.rsi1.toFixed(1)} → ${r.div.rsi2.toFixed(1)}`;
+  if(s===4) lines += `<br>iFVG <b>FORMING</b> since ${fmtT(r.ifvg.time)} · zone ${fmtP(r.ifvg.bottom)} - ${fmtP(r.ifvg.top)}<br>Waiting for a 5m close below ${fmtP(r.ifvg.bottom)}`;
+  if(s===5) lines += `<br>iFVG <b>CONFIRMED</b> ${fmtT(r.ifvg.time)} · FVG formed ${fmtT(r.ifvg.fvgTime)} · zone ${fmtP(r.ifvg.bottom)} - ${fmtP(r.ifvg.top)}<br>Stop ref (sweep high): ${fmtP(r.sweepHigh)}`;
+  return `<div class="card res s${s}">
+    <div class="top"><span class="sym">${r.sym}/USD</span><span class="tag">${LABEL[s]}</span></div>
+    <div class="steps">${steps}</div>
+    <div class="meta">${lines}<br>
+      <a href="https://www.tradingview.com/chart/?symbol=BINANCE:${r.sym}USDT.P&interval=240" target="_blank">TradingView 4H</a> &nbsp;·&nbsp; <a href="https://www.tradingview.com/chart/?symbol=BINANCE:${r.sym}USDT.P&interval=5" target="_blank">TradingView 5m</a></div>
+  </div>`;
+}
+
+let running = false;
+async function scan(){
+  if(running) return;
+  running = true;
+  const btn = document.getElementById('go'), out = document.getElementById('out'),
+        st = document.getElementById('status'), bb = document.getElementById('biasBox');
+  const cfg = {
+    c1color: document.getElementById('c1color').value,
+    measure: document.getElementById('measure').value,
+    rsiN: +document.getElementById('rsiN').value || 14
+  };
+  const biasMode = document.getElementById('bias').value;
+  const minStage = +document.getElementById('minStage').value;
+  const coins = document.getElementById('coins').value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean);
+  btn.disabled = true; out.innerHTML = ''; bb.innerHTML = '';
+  st.textContent = 'Checking BTC Daily bias...';
+
+  try{
+    if(biasMode !== 'off'){
+      const b = await btcBias(biasMode);
+      const ref = biasMode === 'strict' ? `prev low ${fmtP(b.p.low)}` : `prev close ${fmtP(b.p.close)}`;
+      bb.innerHTML = `<div class="card bias ${b.bear?'ok':'no'}"><b>BTC Daily: ${b.bear?'BEARISH - short setups allowed':'NOT bearish - short setups hidden'}</b><br>
+        Last closed Daily close ${fmtP(b.l.close)} vs ${ref}<br><span style="color:#8b949e">Daily candle closes 8:00 AM PH</span></div>`;
+      if(!b.bear){
+        st.textContent = 'Stopped: BTC Daily bias is not bearish. Choose "Ignore bias" to scan anyway.';
+        return;
+      }
+    }
+
+    const all = []; let done = 0, errs = 0;
+    const queue = [...coins];
+    async function worker(){
+      while(queue.length){
+        const sym = queue.shift();
+        try{
+          const k4 = await getH4(sym);
+          let r = analyze(sym, k4, [], cfg);
+          if(r && r.stage === 1 && k4.some(x => x.time >= r.c1.time + H4 && x.high > r.c1.high)){
+            const m5 = await getM5(sym);
+            r = analyze(sym, k4, m5, cfg);
+          }
+          if(r) all.push(r);
+        }catch(e){ errs++; }
+        done++; st.textContent = `Scanning ${done}/${coins.length}...`;
+      }
+    }
+    await Promise.all([worker(), worker(), worker(), worker()]);
+
+    const ev = r => (r.ifvg&&r.ifvg.time) || (r.div&&r.div.time) || r.sweepTime || 0;
+    const shown = all.filter(r => r.stage >= minStage).sort((a,b) => b.stage - a.stage || ev(b) - ev(a));
+    st.textContent = `Done ${new Date().toLocaleTimeString('en-PH',{timeZone:'Asia/Manila',hour12:false})} PH · ${shown.length} shown / ${all.length} scanned${errs?` · ${errs} failed`:''}`;
+    out.innerHTML = shown.map(card).join('') || '<div class="card">Walang setup sa stage na ito ngayon.</div>';
+  }catch(e){
+    st.textContent = 'Error: ' + e.message;
+  }finally{
+    btn.disabled = false; running = false;
+  }
+}
+
+document.getElementById('go').addEventListener('click', scan);
+let timer = null;
+document.getElementById('auto').addEventListener('change', e => {
+  clearInterval(timer);
+  if(e.target.checked){ scan(); timer = setInterval(scan, 300000); }
+});
+</script>
+</body>
+</html>
